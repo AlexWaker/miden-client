@@ -4,7 +4,13 @@ use miden_client::address::{Address, AddressId};
 
 use super::{CLIENT_CONFIG_FILE_NAME, get_account_with_id_prefix};
 use crate::commands::account::DEFAULT_ACCOUNT_ID_KEY;
-use crate::config::{CliConfig, get_global_miden_dir, get_local_miden_dir};
+use crate::config::{
+    CliConfig,
+    get_global_miden_dir,
+    get_global_miden_dir_in,
+    get_local_miden_dir,
+    get_local_miden_dir_in,
+};
 use crate::errors::CliError;
 use crate::faucet_details_map::FaucetDetailsMap;
 
@@ -85,6 +91,20 @@ pub(super) fn config_file_exists() -> Result<bool, CliError> {
     })?;
 
     Ok(global_miden_dir.join(CLIENT_CONFIG_FILE_NAME).exists())
+}
+
+/// Checks if either local or global configuration file exists, using explicit directories.
+///
+/// This avoids relying on process-global state like the current working directory or the user's
+/// HOME, which is important for running tests in parallel.
+pub(super) fn config_file_exists_in_dirs(cwd: &std::path::Path, home_dir: &std::path::Path) -> bool {
+    let local_miden_dir = get_local_miden_dir_in(cwd);
+    if local_miden_dir.join(CLIENT_CONFIG_FILE_NAME).exists() {
+        return true;
+    }
+
+    let global_miden_dir = get_global_miden_dir_in(home_dir);
+    global_miden_dir.join(CLIENT_CONFIG_FILE_NAME).exists()
 }
 
 /// Returns the faucet details map using the config file.

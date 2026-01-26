@@ -14,7 +14,9 @@ use crate::config::{
     Network,
     NoteTransportConfig,
     get_global_miden_dir,
+    get_global_miden_dir_in,
     get_local_miden_dir,
+    get_local_miden_dir_in,
 };
 use crate::errors::CliError;
 
@@ -134,6 +136,28 @@ impl InitCmd {
             )
         };
 
+        self.execute_at(target_miden_dir, config_type)
+    }
+
+    /// Same as [`InitCmd::execute()`], but uses explicit directories instead of process-global
+    /// state.
+    ///
+    /// This is primarily intended for tests and embedding scenarios.
+    pub(crate) fn execute_in_dirs(
+        &self,
+        cwd: &std::path::Path,
+        home_dir: &std::path::Path,
+    ) -> Result<(), CliError> {
+        let (target_miden_dir, config_type) = if self.local {
+            (get_local_miden_dir_in(cwd), "local")
+        } else {
+            (get_global_miden_dir_in(home_dir), "global")
+        };
+
+        self.execute_at(target_miden_dir, config_type)
+    }
+
+    fn execute_at(&self, target_miden_dir: PathBuf, config_type: &str) -> Result<(), CliError> {
         let config_file_path = target_miden_dir.join(CLIENT_CONFIG_FILE_NAME);
 
         // Check if config already exists

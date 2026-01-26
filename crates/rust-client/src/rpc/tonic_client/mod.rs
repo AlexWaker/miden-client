@@ -763,7 +763,6 @@ impl NodeRpcClient for GrpcClient {
         block_to: Option<BlockNumber>,
         account_id: AccountId,
     ) -> Result<StorageMapInfo, RpcError> {
-        let mut rpc_api = self.ensure_connected().await?;
         let block_to = block_to.map(|b| b.as_u32());
         let account_id = Some(account_id.into());
 
@@ -771,10 +770,10 @@ impl NodeRpcClient for GrpcClient {
             block_from.as_u32(),
             block_to,
             |block_from, block_to| {
-                let rpc_api = &mut rpc_api;
                 let account_id = account_id.clone();
 
                 async move {
+                    let mut rpc_api = self.ensure_connected().await?;
                     let request = proto::rpc::SyncAccountStorageMapsRequest {
                         block_range: Some(BlockRange { block_from, block_to }),
                         account_id,
@@ -817,7 +816,6 @@ impl NodeRpcClient for GrpcClient {
         block_to: Option<BlockNumber>,
         account_id: AccountId,
     ) -> Result<AccountVaultInfo, RpcError> {
-        let mut rpc_api = self.ensure_connected().await?;
         let block_to = block_to.map(|b| b.as_u32());
         let account_id = Some(account_id.into());
 
@@ -825,10 +823,10 @@ impl NodeRpcClient for GrpcClient {
             block_from.as_u32(),
             block_to,
             |block_from, block_to| {
-                let rpc_api = &mut rpc_api;
                 let account_id = account_id.clone();
 
                 async move {
+                    let mut rpc_api = self.ensure_connected().await?;
                     let request = proto::rpc::SyncAccountVaultRequest {
                         block_range: Some(BlockRange { block_from, block_to }),
                         account_id,

@@ -21,18 +21,34 @@ pub const STORE_FILENAME: &str = "store.sqlite3";
 pub const KEYSTORE_DIRECTORY: &str = "keystore";
 pub const DEFAULT_REMOTE_PROVER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Returns the global miden directory path given a home directory.
+///
+/// This is primarily useful for testing and advanced embedding scenarios where the caller wants to
+/// control the directory layout without mutating process-wide environment variables.
+pub fn get_global_miden_dir_in(home_dir: &Path) -> PathBuf {
+    home_dir.join(MIDEN_DIR)
+}
+
+/// Returns the local miden directory path given a working directory.
+///
+/// This is primarily useful for testing and advanced embedding scenarios where the caller wants to
+/// control the directory layout without mutating process-wide state such as the current directory.
+pub fn get_local_miden_dir_in(cwd: &Path) -> PathBuf {
+    cwd.join(MIDEN_DIR)
+}
+
 /// Returns the global miden directory path in the user's home directory
 pub fn get_global_miden_dir() -> Result<PathBuf, std::io::Error> {
     dirs::home_dir()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "Could not determine home directory")
         })
-        .map(|home| home.join(MIDEN_DIR))
+        .map(|home| get_global_miden_dir_in(&home))
 }
 
 /// Returns the local miden directory path relative to the current working directory
 pub fn get_local_miden_dir() -> Result<PathBuf, std::io::Error> {
-    std::env::current_dir().map(|cwd| cwd.join(MIDEN_DIR))
+    std::env::current_dir().map(|cwd| get_local_miden_dir_in(&cwd))
 }
 
 // CLI CONFIG
@@ -319,6 +335,32 @@ impl CliConfig {
                 })
             },
             // For other errors (like parse errors), propagate them immediately
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Loads configuration using the same priority as [`CliConfig::from_system()`], but with
+    /// explicit directories.
+    ///
+    /// This is primarily intended for tests and embedding scenarios where mutating process-global
+    /// state (e.g. current working directory or HOME) is undesirable.
+    ///
+    /// Priority:
+    /// 1. `<cwd>/.miden/miden-client.toml`
+    /// 2. `<home_dir>/.miden/miden-client.toml`
+    pub fn from_system_in_dirs(cwd: &Path, home_dir: &Path) -> Result<Self, CliError> {
+        let local_miden_dir = get_local_miden_dir_in(cwd);
+        match Self::from_dir(&local_miden_dir) {
+            Ok(config) => Ok(config),
+            Err(CliError::ConfigNotFound(_)) => {
+                let global_miden_dir = get_global_miden_dir_in(home_dir);
+                Self::from_dir(&global_miden_dir).map_err(|e| match e {
+                    CliError::ConfigNotFound(_) => CliError::ConfigNotFound(
+                        "Neither local nor global config file exists".to_string(),
+                    ),
+                    other => other,
+                })
+            },
             Err(e) => Err(e),
         }
     }

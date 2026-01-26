@@ -28,7 +28,7 @@ use commands::sync::SyncCmd;
 use commands::tags::TagsCmd;
 use commands::transactions::TransactionCmd;
 
-use self::utils::config_file_exists;
+use self::utils::{config_file_exists, config_file_exists_in_dirs};
 use crate::commands::address::AddressCmd;
 
 pub type CliKeyStore = FilesystemKeyStore;
@@ -234,6 +234,32 @@ impl CliClient {
         let config = CliConfig::from_system()?;
 
         // Create client using the loaded configuration
+        Self::from_config(config, debug_mode).await
+    }
+
+    /// Creates a new `CliClient` instance using explicit working and home directories.
+    ///
+    /// This is primarily intended for tests and embedding scenarios where mutating process-global
+    /// state (such as the current working directory or `HOME`) is undesirable.
+    ///
+    /// The configuration discovery priority matches the CLI:
+    /// 1. `<cwd>/.miden/miden-client.toml`
+    /// 2. `<home_dir>/.miden/miden-client.toml`
+    ///
+    /// If neither exists, this function will perform "silent initialization" by creating a
+    /// **global** config under `<home_dir>/.miden`.
+    pub async fn from_system_user_config_in_dirs(
+        cwd: &std::path::Path,
+        home_dir: &std::path::Path,
+        debug_mode: miden_client::DebugMode,
+    ) -> Result<Self, CliError> {
+        // Silently initialize the client (global) if no config exists
+        if !config_file_exists_in_dirs(cwd, home_dir) {
+            let init_cmd = InitCmd::default();
+            init_cmd.execute_in_dirs(cwd, home_dir)?;
+        }
+
+        let config = CliConfig::from_system_in_dirs(cwd, home_dir)?;
         Self::from_config(config, debug_mode).await
     }
 

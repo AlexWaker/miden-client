@@ -107,10 +107,9 @@ fn init_with_params() {
 }
 
 #[test]
-#[serial_test::file_serial]
 fn silent_initialization_uses_default_values() {
-    // Clean up any existing global config first
-    cleanup_global_config();
+    let test_home_dir = temp_dir().join(format!("cli-test-home-{}", rand::rng().random::<u64>()));
+    std::fs::create_dir_all(&test_home_dir).unwrap();
 
     let temp_dir = temp_dir().join(format!("cli-test-{}", rand::rng().random::<u64>()));
     std::fs::create_dir_all(&temp_dir).unwrap();
@@ -118,10 +117,17 @@ fn silent_initialization_uses_default_values() {
     // Run any command to trigger silent initialization (should create global config)
     let mut account_cmd = cargo_bin_cmd!("miden-client");
     account_cmd.args(["account"]);
-    account_cmd.current_dir(&temp_dir).assert().success();
+    account_cmd
+        .current_dir(&temp_dir)
+        .env("HOME", &test_home_dir)
+        .env("XDG_CONFIG_HOME", &test_home_dir)
+        .env("XDG_DATA_HOME", &test_home_dir)
+        .env("XDG_STATE_HOME", &test_home_dir)
+        .assert()
+        .success();
 
     // Read and verify the global config file contents
-    let global_config_path = dirs::home_dir().unwrap().join(MIDEN_DIR).join("miden-client.toml");
+    let global_config_path = test_home_dir.join(MIDEN_DIR).join("miden-client.toml");
     let config_content = std::fs::read_to_string(&global_config_path).unwrap();
 
     // Verify default values are used
@@ -149,7 +155,8 @@ fn silent_initialization_uses_default_values() {
     );
 
     // Clean up
-    cleanup_global_config();
+    let _ = std::fs::remove_dir_all(&test_home_dir);
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
@@ -666,7 +673,6 @@ async fn init_with_testnet() -> Result<()> {
 }
 
 #[tokio::test]
-#[serial_test::file_serial]
 async fn debug_mode_outputs_logs() -> Result<()> {
     // This test tries to execute a transaction with debug mode enabled and checks that the stack
     // state is printed. We need to use the CLI for this because the debug logs are always printed
@@ -674,9 +680,6 @@ async fn debug_mode_outputs_logs() -> Result<()> {
     // We use the [`Client`] to create a custom note that will print the stack state and consume it
     // using the CLI to check the stdout.
     const NOTE_FILENAME: &str = "test_note.mno";
-    unsafe {
-        env::set_var("MIDEN_DEBUG", "true");
-    }
 
     // Create a Client and a custom note
     let (store_path, _, endpoint) = init_cli();
@@ -749,13 +752,10 @@ async fn debug_mode_outputs_logs() -> Result<()> {
     consume_note_cmd.args(&cli_args);
     consume_note_cmd
         .current_dir(&temp_dir)
+        .env("MIDEN_DEBUG", "true")
         .assert()
         .success()
         .stdout(contains("Stack state"));
-
-    unsafe {
-        env::remove_var("MIDEN_DEBUG");
-    }
 
     Ok(())
 }
@@ -951,22 +951,6 @@ fn init_cli_with_store_path(store_path: &Path, endpoint: &Endpoint) -> PathBuf {
     init_cmd.current_dir(&temp_dir).assert().success();
 
     temp_dir
-}
-
-/// Helper function to clean up global config for testing
-fn cleanup_global_config() {
-    if let Some(home_dir) = dirs::home_dir() {
-        let global_miden_dir = home_dir.join(MIDEN_DIR);
-        if global_miden_dir.exists() {
-            // Try multiple times in case of file locks
-            for _ in 0..3 {
-                if std::fs::remove_dir_all(&global_miden_dir).is_ok() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    }
 }
 
 // Syncs CLI on directory. It'll try syncing until the command executes successfully. If it never
@@ -1368,24 +1352,20 @@ fn create_account_with_ecdsa_auth() {
 /// Tests that `CliClient::from_system_user_config()` successfully creates a client with the same
 /// configuration as the CLI tool when a local config exists.
 #[tokio::test]
-#[serial_test::file_serial]
 async fn test_from_system_user_config_with_local_config() -> Result<()> {
     // Initialize a local CLI configuration
-    let (store_path, temp_dir, _endpoint) = init_cli();
+    let (store_path, cli_dir, _endpoint) = init_cli();
 
-    // Ensure no global config exists to verify local config takes priority
-    cleanup_global_config();
+    let test_home_dir = temp_dir().join(format!("cli-test-home-{}", rand::rng().random::<u64>()));
+    std::fs::create_dir_all(&test_home_dir)?;
 
-    // Change to the temp directory where local .miden config exists
-    let original_dir = env::current_dir().unwrap();
-    env::set_current_dir(&temp_dir)?;
-
-    // Create a client using from_system_user_config - should pick up local config
-    let client_result =
-        miden_client_cli::CliClient::from_system_user_config(DebugMode::Disabled).await;
-
-    // Restore original directory
-    env::set_current_dir(original_dir)?;
+    // Create a client using explicit dirs - should pick up local config
+    let client_result = miden_client_cli::CliClient::from_system_user_config_in_dirs(
+        &cli_dir,
+        &test_home_dir,
+        DebugMode::Disabled,
+    )
+    .await;
 
     // Assert the client was created successfully
     assert!(
@@ -1401,36 +1381,33 @@ async fn test_from_system_user_config_with_local_config() -> Result<()> {
         "Local store file should exist at {store_path:?}, indicating local config was used"
     );
 
+    let _ = std::fs::remove_dir_all(&test_home_dir);
     Ok(())
 }
 
 /// Tests that `CliClient::from_system_user_config()` silently initializes with default config
 /// when no configuration exists.
 #[tokio::test]
-#[serial_test::file_serial]
 async fn test_from_system_user_config_silent_init() -> Result<()> {
     // Create a temporary directory with no .miden configuration
-    let temp_dir = temp_dir().join(format!("cli-test-silent-init-{}", rand::rng().random::<u64>()));
-    std::fs::create_dir_all(&temp_dir)?;
+    let work_dir = temp_dir().join(format!("cli-test-silent-init-{}", rand::rng().random::<u64>()));
+    std::fs::create_dir_all(&work_dir)?;
 
-    // Ensure no global config exists
-    cleanup_global_config();
+    let test_home_dir = temp_dir().join(format!("cli-test-home-{}", rand::rng().random::<u64>()));
+    std::fs::create_dir_all(&test_home_dir)?;
 
     // Verify no config exists before we start
-    let global_miden_dir = dirs::home_dir().unwrap().join(MIDEN_DIR);
+    let global_miden_dir = test_home_dir.join(MIDEN_DIR);
     let global_config_path = global_miden_dir.join("miden-client.toml");
     assert!(!global_config_path.exists(), "Global config should not exist before test");
 
-    // Change to the temp directory
-    let original_dir = env::current_dir().unwrap();
-    env::set_current_dir(&temp_dir)?;
-
     // Create a client - should succeed via silent initialization
-    let client_result =
-        miden_client_cli::CliClient::from_system_user_config(DebugMode::Disabled).await;
-
-    // Restore original directory
-    env::set_current_dir(original_dir)?;
+    let client_result = miden_client_cli::CliClient::from_system_user_config_in_dirs(
+        &work_dir,
+        &test_home_dir,
+        DebugMode::Disabled,
+    )
+    .await;
 
     // Assert the client was created successfully
     assert!(
@@ -1446,18 +1423,17 @@ async fn test_from_system_user_config_silent_init() -> Result<()> {
     );
 
     // Clean up temp directory and global config
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    cleanup_global_config();
+    let _ = std::fs::remove_dir_all(&work_dir);
+    let _ = std::fs::remove_dir_all(&test_home_dir);
 
     Ok(())
 }
 
 /// Tests that `CliConfig::from_system()` prioritizes local config over global config.
 #[tokio::test]
-#[serial_test::file_serial]
 async fn test_from_system_user_config_local_priority() -> Result<()> {
-    // Clean up any existing global config
-    cleanup_global_config();
+    let test_home_dir = temp_dir().join(format!("cli-test-home-{}", rand::rng().random::<u64>()));
+    std::fs::create_dir_all(&test_home_dir)?;
 
     // Create a global config with testnet endpoint
     let global_store_path = create_test_store_path();
@@ -1475,24 +1451,32 @@ async fn test_from_system_user_config_local_priority() -> Result<()> {
         "--store-path",
         global_store_path.to_str().unwrap(),
     ]);
-    init_global_cmd.current_dir(&temp_dir_for_global).assert().success();
+    init_global_cmd
+        .current_dir(&temp_dir_for_global)
+        .env("HOME", &test_home_dir)
+        .env("XDG_CONFIG_HOME", &test_home_dir)
+        .env("XDG_DATA_HOME", &test_home_dir)
+        .env("XDG_STATE_HOME", &test_home_dir)
+        .assert()
+        .success();
 
     // Create a local config with localhost endpoint
     let local_store_path = create_test_store_path();
     let local_endpoint = Endpoint::localhost();
     let local_temp_dir = init_cli_with_store_path(&local_store_path, &local_endpoint);
 
-    // Load config from the specific local directory (no need to change working directory!)
-    let local_miden_dir = local_temp_dir.join(MIDEN_DIR);
-    let config = miden_client_cli::CliConfig::from_dir(&local_miden_dir)?;
-
-    // Create client with local config
-    let client = miden_client_cli::CliClient::from_config(config, DebugMode::Disabled).await;
+    // Create client using explicit dirs - should prioritize local config
+    let client = miden_client_cli::CliClient::from_system_user_config_in_dirs(
+        &local_temp_dir,
+        &test_home_dir,
+        DebugMode::Disabled,
+    )
+    .await;
 
     // Clean up
     let _ = std::fs::remove_dir_all(&temp_dir_for_global);
     let _ = std::fs::remove_dir_all(&local_temp_dir);
-    cleanup_global_config();
+    let _ = std::fs::remove_dir_all(&test_home_dir);
 
     // Assert client was created with local config
     assert!(client.is_ok(), "Failed to create client with local config: {:?}", client.err());
