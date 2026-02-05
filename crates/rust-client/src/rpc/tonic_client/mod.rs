@@ -46,6 +46,83 @@ use crate::transaction::ForeignAccount;
 mod api_client;
 use api_client::api_client_wrapper::ApiClient;
 
+/// Maximum number of pagination requests per block-driven sync.
+///
+/// Protects against nodes returning inconsistent pagination data that could otherwise
+/// trigger an infinite loop.
+const MAX_PAGINATION_REQUESTS: u32 = 1000;
+
+/// Result of paginating a block-driven endpoint.
+struct BlockPaginationResult<T> {
+    /// Chain tip reported by the node for the final page.
+    chain_tip: u32,
+    /// Block number reported by the node for the final page.
+    block_number: u32,
+    /// Accumulated items across all pages.
+    updates: Vec<T>,
+}
+
+/// Paginates block-driven endpoints by requesting one page at a time until the target block.
+///
+/// The cursor is `block_from`: each page is requested with a range starting at `current_block_from`
+/// (inclusive); it is then advanced to `page.block_num + 1` (with overflow check) until
+/// `page.block_num >= target_block`. Returns an error if the iteration limit is exceeded.
+async fn run_block_driven_pagination<F, Fut, T>(
+    block_from: u32,
+    block_to: Option<u32>,
+    max_requests: u32,
+    mut fetch_page: F,
+) -> Result<BlockPaginationResult<T>, RpcError>
+where
+    F: FnMut(u32, Option<u32>) -> Fut,
+    Fut: core::future::Future<Output = Result<(Vec<T>, proto::rpc::PaginationInfo), RpcError>>,
+{
+    let mut all_items = Vec::new();
+    let mut current_block_from = block_from;
+    let mut final_chain_tip = 0u32;
+    let mut final_block_num = 0u32;
+    let mut requests = 0u32;
+
+    loop {
+        if requests >= max_requests {
+            return Err(RpcError::InvalidResponse(
+                "too many pagination iterations, possible infinite loop".to_owned(),
+            ));
+        }
+        requests += 1;
+
+        let (batch, page) = fetch_page(current_block_from, block_to).await?;
+
+        if page.block_num < current_block_from {
+            return Err(RpcError::InvalidResponse(
+                "invalid pagination: block_num went backwards".to_owned(),
+            ));
+        }
+
+        all_items.extend(batch);
+        final_chain_tip = page.chain_tip;
+        final_block_num = page.block_num;
+
+        let target_block = block_to.map_or(page.chain_tip, |to| to.min(page.chain_tip));
+
+        if page.block_num >= target_block {
+            break;
+        }
+
+        current_block_from = page.block_num.checked_add(1).ok_or_else(|| {
+            RpcError::InvalidResponse(
+                "invalid pagination: block_num overflow".to_owned(),
+            )
+        })?;
+    }
+
+    Ok(BlockPaginationResult {
+        chain_tip: final_chain_tip,
+        block_number: final_block_num,
+        updates: all_items,
+    })
+}
+
 // GRPC CLIENT
 // ================================================================================================
 
@@ -771,58 +848,61 @@ impl NodeRpcClient for GrpcClient {
         block_to: Option<BlockNumber>,
         account_id: AccountId,
     ) -> Result<StorageMapInfo, RpcError> {
-        let mut all_updates = Vec::new();
-        let mut current_block_from = block_from.as_u32();
-        let mut target_block_reached = false;
-        let mut final_chain_tip = 0;
-        let mut final_block_num = 0;
+        let rpc_api = self.ensure_connected().await?;
+        let context = AcceptHeaderContext {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            genesis_commitment: self
+                .genesis_commitment
+                .read()
+                .as_ref()
+                .map_or_else(|| "none".to_string(), Word::to_hex),
+        };
+        let endpoint = NodeRpcClientEndpoint::SyncStorageMaps;
+        let block_to_u32 = block_to.map(|b| b.as_u32());
 
-        let mut rpc_api = self.ensure_connected().await?;
-
-        while !target_block_reached {
-            let request = proto::rpc::SyncAccountStorageMapsRequest {
-                block_range: Some(BlockRange {
-                    block_from: current_block_from,
-                    block_to: block_to.map(|b| b.as_u32()),
-                }),
-                account_id: Some(account_id.into()),
-            };
-
-            let response = rpc_api.sync_account_storage_maps(request).await.map_err(|status| {
-                self.rpc_error_from_status(NodeRpcClientEndpoint::SyncStorageMaps, status)
-            })?;
-            let response = response.into_inner();
-
-            let batch_updates = response
-                .updates
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<Vec<StorageMapUpdate>, _>>()?;
-            all_updates.extend(batch_updates);
-
-            let page = response
-                .pagination_info
-                .ok_or(RpcError::ExpectedDataMissing("pagination_info".to_owned()))?;
-
-            if page.block_num < current_block_from {
-                return Err(RpcError::InvalidResponse(
-                    "invalid pagination: block_num went backwards".to_owned(),
-                ));
-            }
-
-            final_chain_tip = page.chain_tip;
-            final_block_num = page.block_num;
-
-            let target_block = block_to.map_or(page.chain_tip, |b| b.as_u32().min(page.chain_tip));
-
-            target_block_reached = page.block_num >= target_block;
-            current_block_from = page.block_num + 1;
-        }
+        let BlockPaginationResult {
+            chain_tip,
+            block_number,
+            updates,
+        } = run_block_driven_pagination(
+            block_from.as_u32(),
+            block_to_u32,
+            MAX_PAGINATION_REQUESTS,
+            |block_from, block_to| {
+                let mut rpc_api = rpc_api.clone();
+                let account_id = account_id;
+                let context = context.clone();
+                let endpoint = endpoint.clone();
+                async move {
+                    let request = proto::rpc::SyncAccountStorageMapsRequest {
+                        block_range: Some(BlockRange { block_from, block_to }),
+                        account_id: Some(account_id.into()),
+                    };
+                    let response = rpc_api
+                        .sync_account_storage_maps(request)
+                        .await
+                        .map_err(|status| {
+                            RpcError::from_grpc_error_with_context(endpoint, status, context)
+                        })?;
+                    let response = response.into_inner();
+                    let page = response.pagination_info.ok_or(
+                        RpcError::ExpectedDataMissing("pagination_info".to_owned()),
+                    )?;
+                    let batch = response
+                        .updates
+                        .into_iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<Vec<StorageMapUpdate>, _>>()?;
+                    Ok((batch, page))
+                }
+            },
+        )
+        .await?;
 
         Ok(StorageMapInfo {
-            chain_tip: final_chain_tip.into(),
-            block_number: final_block_num.into(),
-            updates: all_updates,
+            chain_tip: chain_tip.into(),
+            block_number: block_number.into(),
+            updates,
         })
     }
 
@@ -832,61 +912,61 @@ impl NodeRpcClient for GrpcClient {
         block_to: Option<BlockNumber>,
         account_id: AccountId,
     ) -> Result<AccountVaultInfo, RpcError> {
-        let mut all_updates = Vec::new();
-        let mut current_block_from = block_from.as_u32();
-        let mut target_block_reached = false;
-        let mut final_chain_tip = 0;
-        let mut final_block_num = 0;
+        let rpc_api = self.ensure_connected().await?;
+        let context = AcceptHeaderContext {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            genesis_commitment: self
+                .genesis_commitment
+                .read()
+                .as_ref()
+                .map_or_else(|| "none".to_string(), Word::to_hex),
+        };
+        let endpoint = NodeRpcClientEndpoint::SyncAccountVault;
+        let block_to_u32 = block_to.map(|b| b.as_u32());
 
-        let mut rpc_api = self.ensure_connected().await?;
-
-        while !target_block_reached {
-            let request = proto::rpc::SyncAccountVaultRequest {
-                block_range: Some(BlockRange {
-                    block_from: current_block_from,
-                    block_to: block_to.map(|b| b.as_u32()),
-                }),
-                account_id: Some(account_id.into()),
-            };
-
-            let response = rpc_api
-                .sync_account_vault(request)
-                .await
-                .map_err(|status| {
-                    self.rpc_error_from_status(NodeRpcClientEndpoint::SyncAccountVault, status)
-                })?
-                .into_inner();
-
-            let batch_updates = response
-                .updates
-                .iter()
-                .map(|u| (*u).try_into())
-                .collect::<Result<Vec<AccountVaultUpdate>, _>>()?;
-            all_updates.extend(batch_updates);
-
-            let page = response
-                .pagination_info
-                .ok_or(RpcError::ExpectedDataMissing("pagination_info".to_owned()))?;
-
-            if page.block_num < current_block_from {
-                return Err(RpcError::InvalidResponse(
-                    "invalid pagination: block_num went backwards".to_owned(),
-                ));
-            }
-
-            final_chain_tip = page.chain_tip;
-            final_block_num = page.block_num;
-
-            let target_block = block_to.map_or(page.chain_tip, |b| b.as_u32().min(page.chain_tip));
-
-            target_block_reached = page.block_num >= target_block;
-            current_block_from = page.block_num + 1;
-        }
+        let BlockPaginationResult {
+            chain_tip,
+            block_number,
+            updates,
+        } = run_block_driven_pagination(
+            block_from.as_u32(),
+            block_to_u32,
+            MAX_PAGINATION_REQUESTS,
+            |block_from, block_to| {
+                let mut rpc_api = rpc_api.clone();
+                let account_id = account_id;
+                let context = context.clone();
+                let endpoint = endpoint.clone();
+                async move {
+                    let request = proto::rpc::SyncAccountVaultRequest {
+                        block_range: Some(BlockRange { block_from, block_to }),
+                        account_id: Some(account_id.into()),
+                    };
+                    let response = rpc_api
+                        .sync_account_vault(request)
+                        .await
+                        .map_err(|status| {
+                            RpcError::from_grpc_error_with_context(endpoint, status, context)
+                        })?;
+                    let response = response.into_inner();
+                    let page = response.pagination_info.ok_or(
+                        RpcError::ExpectedDataMissing("pagination_info".to_owned()),
+                    )?;
+                    let batch = response
+                        .updates
+                        .iter()
+                        .map(|u| (*u).try_into())
+                        .collect::<Result<Vec<AccountVaultUpdate>, _>>()?;
+                    Ok((batch, page))
+                }
+            },
+        )
+        .await?;
 
         Ok(AccountVaultInfo {
-            chain_tip: final_chain_tip.into(),
-            block_number: final_block_num.into(),
-            updates: all_updates,
+            chain_tip: chain_tip.into(),
+            block_number: block_number.into(),
+            updates,
         })
     }
 

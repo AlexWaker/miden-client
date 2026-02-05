@@ -395,7 +395,7 @@ pub trait NodeRpcClient: Send + Sync {
 // ================================================================================================
 //
 /// RPC methods for the Miden protocol.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum NodeRpcClientEndpoint {
     Status,
     CheckNullifiers,
